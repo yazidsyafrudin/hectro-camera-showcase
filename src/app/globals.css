@@ -1,0 +1,62 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --background: #060606;
+  --foreground: #EDE8E0;
+  --brass: #C9A05C;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html {
+  background-color: #060606;
+  color: #EDE8E0;
+  scroll-behavior: smooth;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+body {
+  background-color: #060606;
+  color: #EDE8E0;
+  overflow-x: hidden;
+  margin: 0;
+  padding: 0;
+  font-feature-settings: "cv02", "cv03", "cv04", "cv11";
+}
+
+/* Custom scrollbar matching dark luxury aesthetic */
+::-webkit-scrollbar {
+  width: 4px;
+}
+::-webkit-scrollbar-track {
+  background: #060606;
+}
+::-webkit-scrollbar-thumb {
+  background: #232220;
+  border-radius: 2px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #C9A05C;
+}
+
+/* Selection */
+::selection {
+  background: #C9A05C;
+  color: #060606;
+}
+
+/* Hairline rule utility */
+.hairline-b {
+  border-bottom: 1px solid rgba(237, 232, 224, 0.08);
+}
+.hairline-t {
+  border-top: 1px solid rgba(237, 232, 224, 0.08);
+}
+.hairline-brass {
+  border-color: rgba(201, 160, 92, 0.25);
+}
