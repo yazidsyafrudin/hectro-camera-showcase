@@ -32,9 +32,12 @@ export default function HeroCanvasScrubber() {
   // Animation & Frame tracking
   const targetProgressRef = useRef(0);
   const currentProgressRef = useRef(0);
-  const framesCacheRef = useRef<(ImageBitmap | HTMLImageElement | null)[]>([]);
+  const framesCacheRef = useRef<(HTMLImageElement | null)[]>([]);
   const isReducedMotionRef = useRef(false);
   const rafIdRef = useRef<number | null>(null);
+  const isAnimatingRef = useRef(false);
+  const lastDisplayUpdateRef = useRef(0);
+  const loadedCountRef = useRef(0);
 
   // Component state
   const [loadedCount, setLoadedCount] = useState(0);
@@ -85,9 +88,9 @@ export default function HeroCanvasScrubber() {
     const frameIdx = Math.max(1, Math.min(TOTAL_FRAMES, Math.round(progress * (TOTAL_FRAMES - 1)) + 1));
     const img = getNearestFrame(frameIdx);
 
-    if (img) {
-      const imgW = (img as ImageBitmap).width || (img as HTMLImageElement).naturalWidth || 1920;
-      const imgH = (img as ImageBitmap).height || (img as HTMLImageElement).naturalHeight || 1080;
+    if (img && img.complete && img.naturalWidth > 0) {
+      const imgW = img.naturalWidth || 1920;
+      const imgH = img.naturalHeight || 1080;
       const imgRatio = imgW / imgH;
       const canvasRatio = w / h;
 
@@ -106,16 +109,16 @@ export default function HeroCanvasScrubber() {
       }
 
       ctx.imageSmoothingEnabled = true;
-      ctx.imageSmoothingQuality = "high";
+      ctx.imageSmoothingQuality = "medium";
       ctx.drawImage(img, drawX, drawY, drawW, drawH);
     }
   }, [getNearestFrame]);
 
-  // Handle Resize and DPR
+  // Handle Resize and DPR (cap DPR to 1.5 to save massive GPU fill-rate on laptop displays)
   const resizeCanvas = useCallback(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
-    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    const dpr = Math.min(window.devicePixelRatio || 1, 1.5);
     const rect = canvas.getBoundingClientRect();
     const newW = Math.round(rect.width * dpr);
     const newH = Math.round(rect.height * dpr);
@@ -133,56 +136,46 @@ export default function HeroCanvasScrubber() {
     return () => window.removeEventListener("resize", resizeCanvas);
   }, [resizeCanvas]);
 
-  // Frame loading pipeline (Priority + Off-thread decoding)
+  // Frame loading pipeline (Compressed HTMLImageElement caching + progressive batches)
   useEffect(() => {
     framesCacheRef.current = new Array(TOTAL_FRAMES + 1).fill(null);
+    loadedCountRef.current = 0;
     let isCancelled = false;
 
-    // Helper: decode image off main thread if supported
-    async function fetchAndDecode(index: number) {
-      if (isCancelled) return;
+    function fetchAndDecode(index: number): Promise<void> {
+      if (isCancelled || framesCacheRef.current[index]) return Promise.resolve();
       const url = getFrameUrl(index);
-      try {
-        if ("createImageBitmap" in window) {
-          const res = await fetch(url);
-          const blob = await res.blob();
-          const bitmap = await createImageBitmap(blob);
-          if (!isCancelled) {
-            framesCacheRef.current[index] = bitmap;
-            setLoadedCount((c) => c + 1);
-            if (index === 1) {
-              setInitialFrameReady(true);
-              renderFrame(0);
-            }
-          }
-        } else {
-          const img = new Image();
-          img.src = url;
-          await img.decode();
-          if (!isCancelled) {
-            framesCacheRef.current[index] = img;
-            setLoadedCount((c) => c + 1);
-            if (index === 1) {
-              setInitialFrameReady(true);
-              renderFrame(0);
-            }
-          }
-        }
-      } catch {
-        // Fallback simple image
+      return new Promise((resolve) => {
         const img = new Image();
         img.src = url;
-        img.onload = () => {
-          if (!isCancelled) {
-            framesCacheRef.current[index] = img;
-            setLoadedCount((c) => c + 1);
-            if (index === 1) {
-              setInitialFrameReady(true);
-              renderFrame(0);
-            }
+
+        const onDone = () => {
+          if (isCancelled) return resolve();
+          framesCacheRef.current[index] = img;
+          loadedCountRef.current++;
+
+          // Throttle React state updates so we don't trigger 362 renders (updates every ~5%)
+          if (
+            loadedCountRef.current % 18 === 0 ||
+            loadedCountRef.current === TOTAL_FRAMES
+          ) {
+            setLoadedCount(loadedCountRef.current);
           }
+
+          if (index === 1) {
+            setInitialFrameReady(true);
+            renderFrame(currentProgressRef.current);
+          }
+          resolve();
         };
-      }
+
+        if (typeof img.decode === "function") {
+          img.decode().then(onDone).catch(onDone);
+        } else {
+          (img as HTMLImageElement).onload = onDone;
+          (img as HTMLImageElement).onerror = onDone;
+        }
+      });
     }
 
     async function loadAllFrames() {
@@ -199,17 +192,19 @@ export default function HeroCanvasScrubber() {
         await fetchAndDecode(k);
       }
 
-      // 3. Third priority: All remaining frames in batches of 6
+      // 3. Third priority: All remaining frames in batches of 8 with 16ms event loop yield
       const remaining: number[] = [];
       for (let i = 2; i <= TOTAL_FRAMES; i++) {
         if (!framesCacheRef.current[i]) remaining.push(i);
       }
 
-      const BATCH_SIZE = 6;
+      const BATCH_SIZE = 8;
       for (let i = 0; i < remaining.length; i += BATCH_SIZE) {
         if (isCancelled) return;
         const batch = remaining.slice(i, i + BATCH_SIZE);
         await Promise.all(batch.map((idx) => fetchAndDecode(idx)));
+        // Yield to browser event loop to guarantee zero frame drops during scroll
+        await new Promise((r) => setTimeout(r, 16));
       }
     }
 
@@ -220,8 +215,55 @@ export default function HeroCanvasScrubber() {
     };
   }, [renderFrame]);
 
-  // Main scroll calculation & Lerp animation loop
+  // Main scroll calculation & On-Demand Lerp animation loop (Sleeps when idle!)
   useEffect(() => {
+    let lastRenderedProgress = -1;
+
+    const animate = (timestamp: number) => {
+      if (isReducedMotionRef.current) {
+        currentProgressRef.current = targetProgressRef.current;
+      } else {
+        const diff = targetProgressRef.current - currentProgressRef.current;
+        if (Math.abs(diff) > 0.0002) {
+          currentProgressRef.current = lerp(currentProgressRef.current, targetProgressRef.current, 0.12);
+        } else {
+          currentProgressRef.current = targetProgressRef.current;
+        }
+      }
+
+      // Only draw if progress actually moved
+      if (Math.abs(currentProgressRef.current - lastRenderedProgress) > 0.0001) {
+        renderFrame(currentProgressRef.current);
+        lastRenderedProgress = currentProgressRef.current;
+      }
+
+      // Throttle display progress updates to ~30fps for UI overlay React renders
+      if (timestamp - lastDisplayUpdateRef.current > 32) {
+        setDisplayProgress(currentProgressRef.current);
+        lastDisplayUpdateRef.current = timestamp;
+      }
+
+      // Continue animation only if not yet reached target
+      const remaining = Math.abs(targetProgressRef.current - currentProgressRef.current);
+      if (remaining > 0.0002) {
+        rafIdRef.current = requestAnimationFrame(animate);
+      } else {
+        // Snapped to exact position: final display update & stop loop!
+        currentProgressRef.current = targetProgressRef.current;
+        renderFrame(currentProgressRef.current);
+        setDisplayProgress(currentProgressRef.current);
+        isAnimatingRef.current = false;
+        rafIdRef.current = null;
+      }
+    };
+
+    const requestTick = () => {
+      if (!isAnimatingRef.current) {
+        isAnimatingRef.current = true;
+        rafIdRef.current = requestAnimationFrame(animate);
+      }
+    };
+
     const handleScroll = () => {
       if (!containerRef.current) return;
       const rect = containerRef.current.getBoundingClientRect();
@@ -230,42 +272,19 @@ export default function HeroCanvasScrubber() {
 
       const progress = Math.max(0, Math.min(1, -rect.top / scrollableDist));
       targetProgressRef.current = progress;
+      requestTick();
     };
 
     window.addEventListener("scroll", handleScroll, { passive: true });
     handleScroll();
 
-    let lastDisplayUpdate = 0;
-    const animate = (timestamp: number) => {
-      if (isReducedMotionRef.current) {
-        // Reduced motion: jump or stay calm at exploded view or current
-        currentProgressRef.current = targetProgressRef.current;
-      } else {
-        // Smooth lerp interpolation factor (0.12 provides silky, deliberate mechanical inertia)
-        const diff = targetProgressRef.current - currentProgressRef.current;
-        if (Math.abs(diff) > 0.0001) {
-          currentProgressRef.current = lerp(currentProgressRef.current, targetProgressRef.current, 0.12);
-        } else {
-          currentProgressRef.current = targetProgressRef.current;
-        }
-      }
-
-      renderFrame(currentProgressRef.current);
-
-      // Throttle display progress updates to ~30fps for UI overlay React renders
-      if (timestamp - lastDisplayUpdate > 32) {
-        setDisplayProgress(currentProgressRef.current);
-        lastDisplayUpdate = timestamp;
-      }
-
-      rafIdRef.current = requestAnimationFrame(animate);
-    };
-
-    rafIdRef.current = requestAnimationFrame(animate);
-
     return () => {
       window.removeEventListener("scroll", handleScroll);
-      if (rafIdRef.current) cancelAnimationFrame(rafIdRef.current);
+      if (rafIdRef.current) {
+        cancelAnimationFrame(rafIdRef.current);
+        rafIdRef.current = null;
+      }
+      isAnimatingRef.current = false;
     };
   }, [renderFrame]);
 
